@@ -1,0 +1,901 @@
+---
+title: "Defense presentation"
+author: "Aman Malik"
+date: '2022-04-01'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+---
+
+The following code and data were used to prepare the figures for my defence presentation on 29.03.2022, as announced [here](https://www.tu-berlin.de/fak_3/menue/ueber_uns/termine_und_fristen/parameter/maxhilfe).
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(
+ warning = F,
+  cache = T,
+ message = F
+)
+```
+
+## Required Packages
+
+```{r include=FALSE}
+library(tidyverse)
+library(readxl)
+library(quitte)
+library(RColorBrewer)
+library(data.table)
+library(mgsub)
+library(sf)
+library(ggpubr)
+library(ggrepel)
+library(patchwork)
+```
+
+## Data Preperation
+
+### Chapter 2
+
+```{r data_input_ch2_part1, warning=FALSE}
+## Chapter 2, part 1
+load("data/data_IND2019_12_02.RData")
+models <- inline.data.frame(
+  "model;                       model.name",
+  "REMIND-MAgPIE 1.7-3.0;         REMIND",
+  "WITCH2016;          WITCH",
+  "AIM/Enduse 3.0;            AIM/Enduse",
+  "IMAGE 3.0;     IMAGE",
+  "POLES CDL;   POLES",
+  "AIM V2.1; AIM",
+  "India MARKAL; India MARKAL",
+  "GEM-E3; GEM_E3",
+  NULL
+)
+
+## Renaming model names
+whole <- whole %>%
+  replace_column(models, model, model.name) %>%
+  order.levels(scen_name = c("Delayed action", "Early action")) %>%
+  removeColNa() %>%
+  order.levels(model = c("AIM", "IMAGE", "POLES", "GEM_E3", "REMIND", "WITCH", "AIM/Enduse", "India MARKAL"))
+
+## Specific colours for the model names
+myColors <- brewer.pal(8, name = "Dark2") # for unique colors on models
+names(myColors) <- getModels(whole)
+
+# Changing AIM/Enduse values for Capacity|Solar
+whole[whole$model == "AIM/Enduse" & whole$variable == "Capacity|Electricity|Solar", ]$value <- whole[whole$model == "AIM/Enduse" & whole$variable == "Capacity|Electricity|Solar", ]$value + whole[whole$model == "AIM/Enduse" & whole$variable == "Capacity|Electricity|Storage", ]$value
+```
+
+```{r data_input_ch2_part2}
+# Chapter 2 part 2
+
+## Rescaling Secondary energy and converting to capacity
+
+whole_se_elec_coal <- whole %>%
+  filter(variable %in% c("Secondary Energy|Electricity|Coal|w/o CCS"), period %in% c(2020:2070), !is.na(scen_name))
+
+whole_se_elec_coal_2020 <- whole %>%
+  filter(variable %in% c("Secondary Energy|Electricity|Coal|w/o CCS"), period == 2020, scen_name == "Early action")
+
+models <- unique(whole_se_elec_coal$model)
+
+# Normalising SE values to values in 2020
+for (i in models) {
+  whole_se_elec_coal[whole_se_elec_coal$model == i, ]$value <- whole_se_elec_coal[whole_se_elec_coal$model == i, ]$value /
+    whole_se_elec_coal_2020[whole_se_elec_coal_2020$model == i, ]$value
+}
+# setting all model's 2020 SE to 2020 SE (2018 CEA values + some captive capacity :  986591 + 147035.84=1133 GWh)
+whole_se_elec_coal[whole_se_elec_coal$period == 2020, ]$value <- 4.22
+
+whole_se_elec_coal[whole_se_elec_coal$period != 2020, ]$value <- 4.22 * whole_se_elec_coal[whole_se_elec_coal$period != 2020, ]$value
+
+whole_se_elec_coal$value <- whole_se_elec_coal$value * 277777.778 # EJ to GWh
+# converting SE to capacity using current capacity factor
+whole_se_elec_coal$value <- whole_se_elec_coal$value / (8760 * 0.59) # GWh to GW using capacity factor in 2018
+
+whole_coal_cap_resc <- whole_se_elec_coal
+```
+
+```{r data_input_ch2_part3}
+#### Stranding capacity for early and delay scenarios
+
+modelnames <- as.character(unique(whole_se_elec_coal$model))
+df <- fread("data/remaining_delay.csv", header = T)
+df <- df %>% gather(2:41, key = "age", value = "capacity")
+df$age <- as.numeric(df$age)
+df$period <- 2030
+
+df.REMIND <- df %>% filter(model == "REMIND")
+shite.2 <- df.REMIND
+for (i in 1:40) {
+  df.blah <- df.REMIND %>%
+    mutate(capacity = lag(capacity, i, order_by = age)) %>%
+    mutate(period = period + i)
+  shite.2 <- bind_rows(shite.2, df.blah)
+}
+shite.2 <- shite.2 %>%
+  mutate(age_group = ifelse(age < 10, "0-9", ifelse(age >= 10 & age < 20, "10-19", ifelse(age >= 20 & age < 30, "20-29", ifelse(age >= 30 & age <= 40, "30-39", "NA")))))
+
+
+shite.2$age_group <- factor(shite.2$age_group, levels = c("30-39", "20-29", "10-19", "0-9"))
+shite.2[is.na(shite.2)] <- 0
+# finding age group of stranded capacity
+shite.2.try <- shite.2 %>%
+  group_by(model, period, age_group) %>%
+  summarise(vals = sum(capacity))
+stranded <- data.frame(model = character(0), period = numeric(0), age_group = character(0), vals = numeric(0))
+model.data <- whole_se_elec_coal %>%
+  filter(period %in% c(2030:2060), scen_name == "Delayed action", model == "REMIND") %>%
+  select(1, 6, 10)
+
+# interpolate model data
+model.data <- interpolate_missing_periods(model.data, seq(2030, 2050, 1))
+ages <- unique(shite.2$age_group)
+for (i in seq(2030, 2050, 1)) {
+  if (model.data[model.data$period == i, ]$value < shite.2.try[shite.2.try$age_group == "0-9" & shite.2.try$period == i, ]$vals & shite.2.try[shite.2.try$age_group == ages[1] & shite.2.try$period == i, ]$vals != 0) {
+    stranded <- bind_rows(stranded, data.frame(model = "REMIND", period = i, age_group = ages[1], vals = shite.2.try[shite.2.try$age_group == "0-9" & shite.2.try$period == i, ]$vals - model.data[model.data$period == i, ]$value), shite.2.try %>% filter(age_group != j & period == i))
+  } else if (model.data[model.data$period == i, ]$value < sum(shite.2.try[shite.2.try$age_group %in% ages[1:2] & shite.2.try$period == i, ]$vals) & shite.2.try[shite.2.try$age_group == ages[2] & shite.2.try$period == i, ]$vals != 0) {
+    stranded <- bind_rows(stranded, data.frame(model = "REMIND", period = i, age_group = ages[2], vals = as.numeric(shite.2.try %>% filter(period == i, age_group %in% ages[1:2]) %>% group_by(period) %>% summarise(vals = sum(vals)))[2] - model.data[model.data$period == i, ]$value), shite.2.try %>% filter(age_group %in% ages[3:4] & period == i))
+  } else if (model.data[model.data$period == i, ]$value < sum(shite.2.try[shite.2.try$age_group %in% ages[1:3] & shite.2.try$period == i, ]$vals) & shite.2.try[shite.2.try$age_group == ages[3] & shite.2.try$period == i, ]$vals != 0) {
+    stranded <- bind_rows(stranded, data.frame(model = "REMIND", period = i, age_group = ages[3], vals = sum(shite.2.try[shite.2.try$age_group %in% ages[1:3] & shite.2.try$period == i, ]$vals) - model.data[model.data$period == i, ]$value), shite.2.try %>% filter(age_group %in% ages[4] & period == i))
+  } else if (model.data[model.data$period == i, ]$value < sum(shite.2.try[shite.2.try$age_group %in% ages[1:4] & shite.2.try$period == i, ]$vals) & shite.2.try[shite.2.try$age_group == ages[4] & shite.2.try$period == i, ]$vals != 0) {
+    stranded <- bind_rows(stranded, data.frame(model = "REMIND", period = i, age_group = ages[4], vals = sum(shite.2.try[shite.2.try$age_group %in% ages[1:4] & shite.2.try$period == i, ]$vals) - model.data[model.data$period == i, ]$value))
+  } else if (model.data[model.data$period == i, ]$value > sum(shite.2.try[shite.2.try$age_group %in% ages[1:4] & shite.2.try$period == i, ]$vals)) {
+    stranded <- bind_rows(stranded, data.frame(model = "REMIND", period = i, age_group = ages[4], vals = 0))
+  }
+}
+##################################################
+
+###### Early action
+df <- fread("data/remaining_early.csv", header = T)
+# df$model <- modelnames[-5]
+df <- df %>% select(1:41)
+# assuming all plants older than 40 years are retired in 2020
+df <- df %>% gather(2:41, key = "age", value = "capacity")
+df$age <- as.numeric(df$age)
+
+df.REMIND <- df %>% filter(model == "REMIND")
+df.REMIND$period <- 2020
+
+shite <- df.REMIND
+for (i in 1:40) {
+  df.blah <- df.REMIND %>%
+    mutate(capacity = lag(capacity, i, order_by = age)) %>%
+    mutate(period = period + i)
+  shite <- bind_rows(shite, df.blah)
+}
+shite <- shite %>%
+  mutate(age_group = ifelse(age < 10, "0-9", ifelse(age >= 10 & age < 20, "10-19", ifelse(age >= 20 & age < 30, "20-29", ifelse(age >= 30 & age < 40, "30-39", "NA")))))
+
+
+shite$age_group <- factor(shite$age_group, levels = c("30-39", "20-29", "10-19", "0-9"))
+```
+
+```{r data_input_ch2_part4}
+indian_coal <- read_excel("data/india_coal_2.xlsx")
+ic <- indian_coal %>%
+  gather(2:54, value = "value", key = "period")
+colnames(ic)[1] <- "category"
+ic$model <- "CEA"
+ic$period <- as.integer(ic$period)
+ic$scen_name <- "Projections"
+
+
+# Data from Global Energy Monitor
+input.data <-
+  read_excel("C:/Users/amalik/Owncloud/PhD/DISS/carbon lock-ins/Data/Coal_Swarm_INDIA.xlsx")
+
+input.data <- input.data %>%
+  gather(key = "Year", value = "Status", 4:8) %>%
+  filter(Status != "XXX")
+
+input.data$Status <-
+  gsub("Pre|Perm|Ann", replacement = "Planned", input.data$Status)
+input.data$Status <-
+  gsub("She|Can", replacement = "Cancelled", input.data$Status)
+input.data$Status <-
+  gsub("Oper", replacement = "Operating", input.data$Status)
+input.data$Status <-
+  gsub("Ret", replacement = "Retired", input.data$Status)
+input.data$Status <-
+  gsub("Con", replacement = "Construction", input.data$Status)
+
+input.data.2 <-
+  input.data %>%
+  group_by(Year, Status) %>%
+  summarise(sum = sum(Capacity))
+input.data.2 <- data.frame(input.data.2)
+input.data.2$Year <- as.numeric(input.data.2$Year)
+
+# Historical capacity
+hist_IND <- readxl::read_excel("Data/Compiled_historical.xlsx")
+hist_IND <- as.quitte(hist_IND)
+```
+
+### Chapter 3
+
+```{r ch3}
+# Loading input data
+# input data includes jobs, cumulative capacity, new capacity, production for all the two scenarios (NDC and Pol/1.5C) and the 4 EF-scenarios.
+load(file = "data/jobs_2021-01-14.RData")
+df <- df %>%
+  filter(comb2 == "both LP and capcosts") %>%
+  select(-comb, -comb2)
+# replace names of activities
+df$Activity <- gsub("CI", replacement = "C & I", x = df$Activity)
+df$Activity <- gsub("OM", replacement = "O & M", x = df$Activity)
+df$Activity <- gsub("Manf", replacement = "Manufacturing", x = df$Activity)
+df$Activity <- gsub("Fuel_supply", replacement = "Fuel supply", x = df$Activity)
+
+load("data/plants_with_coord_api_2021-03-23.RData") # Operating RE plants from CEA
+load("data/uc_plants_with_coord_api_2021-03-23.RData") # Under-construction plants from CEA
+# load("data/GCPT.RData")# Coal plants from Global Coal Plant Tracker
+load("data/GPPT.Rdata") # All other plants- Gas, oil, diesel from Global Power Plant Tracker
+load("data/hydro_under_construction.RData") # under-construction hydro
+```
+
+### Chapter 4
+```{r data_input_ch4}
+load(file = "data/jobs_2021-01-14.RData")
+df <- df %>% filter(Region=="IND" , comb2=="both LP and capcosts") %>% select(-comb,-comb2) # show results only for India
+# reduce Coal india fuel_supply jobs to match historical values
+ df[df$Variable=="Jobs"& df$Activity=="Fuel_supply" & df$Tech=="Coal",]$Value <- (df[df$Variable=="Jobs"& df$Activity=="Fuel_supply" &  df$Tech=="Coal",]$Value)/1.5
+# # reduce coal manufacturing jobs, assuming 70% of domestic manufacture (which remains constant)
+ df[df$Variable=="Jobs"& df$Activity=="Manf" & df$Tech=="Coal",]$Value <- (df[df$Variable=="Jobs"& df$Activity=="Manf" &  df$Tech=="Coal",]$Value)*0.7
+
+# replace names of activities
+df$Activity <- gsub("CI",replacement = "C & I",x = df$Activity)
+df$Activity <- gsub("OM",replacement = "O & M",x = df$Activity)
+df$Activity <- gsub("Manf",replacement = "Manufacturing",x = df$Activity)
+df$Activity <- gsub("Fuel_supply",replacement = "Fuel supply",x = df$Activity)
+```
+
+```{r gcpt, warning=FALSE, include=FALSE}
+GCPT <- read_excel(path = "data/January 2021 Global Coal Plant Tracker.xlsx", sheet = "Units") %>%
+  filter(Country == "India") %>%
+  select(Unit, Plant, `Capacity (MW)`, Status, Latitude, Longitude, `Plant age`, `Subnational unit (province, state)`)
+
+GCPT_plant <- function(input, stat) {
+  output <- input %>%
+    filter(Status == stat) %>%
+    group_by(Plant) %>%
+    mutate(value = sum(`Capacity (MW)`), Type = "Coal") %>%
+    ungroup() %>%
+    group_by(Plant) %>%
+    slice(which.max(Latitude)) # remove units which have the same coordinates
+  return(output)
+}
+
+# Plant-wise output
+GCPT_3 <- GCPT_plant(GCPT, stat = "Operating")
+
+GCPT_4 <- GCPT_plant(GCPT, stat = "Construction")
+
+GCMT <- read_xlsx(path = "data/Global Coal Mine Tracker (January 2021).xlsx", sheet = "Coal Mines") %>%
+  filter(Country == "India") %>%
+  select(`Mine Name`, `Coal Output (Annual, Mmt)`, Latitude, Longitude, Status)
+```
+
+```{r all_power_plants}
+finalData3 <- finalData2 %>%
+  mutate(
+    lon = if_else(State == "Gujarat" & lon < 0 & Type == "Wind", 70.069, lon),
+    lat = if_else(State == "Gujarat" & lon < 0 & Type == "Wind", 22.3800, lat)
+  ) %>%
+  rename(name = 2, capacity = Capacity, source = Type) %>%
+  mutate(status = "operating", type = "power plant", source = gsub(source, pattern = "Small Hydro", replacement = "Hydro", fixed = T)) %>%
+  select(name, capacity, lat, lon, source, status, type)
+
+input_uc4 <- input_uc3 %>%
+  rename(name = Company, capacity = `Capacity (MW)`, source = Type) %>%
+  mutate(status = "construction", type = "power plant") %>%
+  select(name, capacity, lat, lon, source, status, type)
+
+GCPT_3 <- GCPT_3 %>%
+  rename(name = Plant, lat = Latitude, lon = Longitude, capacity = value) %>%
+  mutate(status = "operating", type = "power plant", source = "Coal") %>%
+  select(name, capacity, lat, lon, source, status, type)
+
+GCPT_4 <- GCPT_4 %>%
+  rename(name = Plant, lat = Latitude, lon = Longitude, capacity = value) %>%
+  mutate(status = "construction", type = "power plant", source = "Coal") %>%
+  select(name, capacity, lat, lon, source, status, type)
+
+ind_miss_eu2 <- ind_miss_eu %>%
+  filter(country_long == "India", name != "KUNDANKULAM") %>%
+  mutate(
+    latitude = if_else(name == "DHAULI GANGA", 29.9797, latitude),
+    longitude = if_else(name == "DHAULI GANGA", 80.5710, longitude)
+  ) %>%
+  select(-source) %>%
+  rename(source = primary_fuel, capacity = capacity_mw, lat = latitude, lon = longitude) %>%
+  mutate(status = "operating", type = "power plant", source = gsub(x = source, pattern = "Biomass", "Biopower", fixed = T)) %>%
+  select(name, capacity, lat, lon, source, status, type)
+
+# includes both planned and operating mines
+GCMT2 <- GCMT %>%
+  rename(name = `Mine Name`, capacity = `Coal Output (Annual, Mmt)`, lat = Latitude, lon = Longitude, status = Status) %>%
+  mutate(type = "extraction", source = "Coal", status = mgsub(status, pattern = c("Operating", "Proposed"), replacement = c("operating", "proposed"))) %>%
+  select(name, capacity, lat, lon, source, status, type)
+
+hydro_uc2 <- hydro_uc %>%
+  rename(name = `Plant Name`, capacity = Capacity, source = Type) %>%
+  mutate(status = "construction", type = "power plant") %>%
+  select(name, capacity, lat, lon, source, status, type)
+
+# all power plants and extraction in common format
+all_pp_ext <- bind_rows(finalData3, input_uc4, GCPT_3, GCPT_4, ind_miss_eu2, hydro_uc2, GCMT2)
+```
+
+```{r}
+####  India shape file state codes, state locations, and centroids
+
+# reading India states shape file
+IND <- read_sf("data/States/Admin2.shp", stringsAsFactors = F, as_tibble = T)
+# Reducing size by simplifying polygon
+IND <- rmapshaper::ms_simplify(IND, keep = 0.01)
+# adding information on state/UT code
+state_code <- read.csv(file = "data/state_code.csv") %>% mutate(State = gsub(pattern = " and", " &", State, fixed = T))
+IND <- IND %>% mutate(ST_NM = gsub(pattern = " and", " &", ST_NM, fixed = T))
+IND2 <- left_join(IND, state_code, by = c("ST_NM" = "State"))
+
+# adding centroids to all the state polygons
+centroid <- do.call(rbind, st_centroid(IND2$geometry)) %>%
+  as_tibble() %>%
+  setNames(c("lon", "lat"))
+# adding state-classification and removing Andaman & Nicobar
+IND2 <- bind_cols(IND2, centroid) %>%
+  filter(ST_NM != "Andaman & Nicobar") %>%
+  mutate(location = ifelse(Code %in% c("RJ", "GJ"), "Western states", ifelse(Code %in% c("CT", "OR", "JH", "WB"), "Eastern states", ifelse(Code %in% c("MH", "KA", "TN", "AP", "TG"), "Southern states", NA))))
+```
+
+```{r}
+########### Technical potentials from NREL and NIWE
+tot_pot <- read_excel(path = "data/india-solar-wind-potential.xlsx", sheet = "tot") %>%
+  rename("Solar" = 2, "Wind" = 3) %>%
+  mutate(variable = "theoretical potential") %>%
+  gather(2:3, key = "source", value = "value")
+
+# Comprehensive solar potentials
+tot_pot_comp <- read_excel(path = "data/india-solar-wind-potential.xlsx", sheet = "solar-comp") %>%
+  filter(!state %in% grep(pattern = "high", state, value = T)) %>%
+  mutate(nameplate_capacity_gw = nameplate_capacity_mw / 1000) %>%
+  select(state, nameplate_capacity_mw, cap_factor) %>%
+  mutate(location = ifelse(state %in% c("RJ", "GJ"), "Western states", ifelse(state %in% c("CT", "OR", "JH", "WB"), "Eastern states", ifelse(state %in% c("MH", "KA", "TN", "AP", "TG"), "Southern states", "Other")))) %>%
+  group_by(state) %>%
+  mutate(avg_cap_factor = sum(nameplate_capacity_mw * cap_factor) / sum(nameplate_capacity_mw)) %>%
+  ungroup() %>%
+  group_by(location) %>%
+  mutate(state = as.factor(state))
+```
+
+```{r}
+
+########### Commissioned and pipeline plants from Bridge to India
+bridge_ind <- read_excel(path = "data/Bridge-to-India-2021.xlsx") %>%
+  rename("source" = 2) %>%
+  gather(3:5, key = "variable", value = "value")
+```
+
+```{r}
+############# Joining above two and adding state locations to it
+bar_plot <- full_join(tot_pot, bridge_ind) %>% mutate(State = gsub(pattern = "Chhatisgarh", replacement = "Chhattisgarh", State))
+bar_plot <- left_join(bar_plot, state_code) %>%
+  filter(variable != "Total") %>%
+  mutate(variable = factor(variable, levels = c("theoretical potential", "Pipeline", "Commissioned"))) %>%
+  # mutate(Code=factor(Code,levels = c("RJ","GJ","MH","KA","TN","AP","TG","MP","CT","JH","OR","WB","IEA-2021"))) %>%
+  mutate(Code = factor(Code, levels = c("RJ", "GJ", "MH", "KA", "TN", "AP", "TG", "MP", "CT", "JH", "OR", "WB"))) %>%
+  mutate(location = ifelse(Code %in% c("RJ", "GJ"), "Western states", ifelse(Code %in% c("CT", "OR", "JH", "WB"), "Eastern states", ifelse(Code %in% c("MH", "KA", "TN", "AP", "TG"), "Southern states", NA)))) %>%
+  as_tibble()
+```
+
+```{r}
+############### Adding additional ranges to eastern states potential
+es_dt <- bar_plot %>%
+  filter(variable != "Total", location == "Eastern states") %>%
+  mutate(constraint = "high") %>%
+  add_row(State = "Odisha", variable = "theoretical potential", source = "Solar", value = 313.55, Code = "OR", location = "Eastern states", constraint = "medium") %>%
+  add_row(State = "Odisha", variable = "theoretical potential", source = "Solar", value = 445.1, Code = "OR", location = "Eastern states", constraint = "low") %>%
+  add_row(State = "Chhattisgarh", variable = "theoretical potential", source = "Solar", value = 115.45, Code = "CT", location = "Eastern states", constraint = "medium") %>%
+  add_row(State = "Chhattisgarh", variable = "theoretical potential", source = "Solar", value = 217.9, Code = "CT", location = "Eastern states", constraint = "low") %>%
+  add_row(State = "Jharkhand", variable = "theoretical potential", source = "Solar", value = 140.8, Code = "JH", location = "Eastern states", constraint = "medium") %>%
+  add_row(State = "Jharkhand", variable = "theoretical potential", source = "Solar", value = 259.6, Code = "JH", location = "Eastern states", constraint = "low") %>%
+  mutate(variable = factor(variable, levels = c("theoretical potential", "Pipeline", "Commissioned")))
+```
+
+
+## Figures
+
+### Chapter 2
+
+#### Change in generation of technologies in 2030 relative to 2020, delayed and early action
+
+```{r}
+vars <- c(
+  "Secondary Energy|Electricity|Coal|w/o CCS",
+  "Secondary Energy|Electricity|Solar",
+  "Secondary Energy|Electricity|Wind",
+  "Secondary Energy|Electricity|Hydro",
+  "Secondary Energy|Electricity|Nuclear",
+  "Secondary Energy|Electricity|Gas|w/o CCS",
+  "Secondary Energy|Electricity",
+  NULL
+)
+
+style_lc <- mip::plotstyle(vars)
+names(style_lc) <- gsub(names(style_lc), pattern = "Secondary Energy\\|Electricity\\|", replacement = "")
+
+names(style_lc) <- gsub(names(style_lc), pattern = "Secondary Energy\\|", replacement = "Total ")
+style_lc[7] <- "#cc0000"
+
+whole_se_coal <- whole %>%
+  filter(variable %in% vars, period %in% c(2020, 2030)) %>%
+  mutate(value = value * 277.778, unit = "TWh") %>%
+  spread(period, value = value) %>%
+  mutate(change = ((`2030` - `2020`) / `2020`) * 100) %>%
+  select(model, variable, model_scope, scen_name, change) %>%
+  mutate(variable = gsub(variable, pattern = "Secondary Energy\\|Electricity\\|", replacement = "")) %>%
+  mutate(variable = gsub(variable, pattern = "Secondary Energy\\|", replacement = "Total ")) %>%
+  mutate(variable = factor(variable, levels = c("Total Electricity", "Coal|w/o CCS", "Gas|w/o CCS", "Hydro", "Nuclear", "Solar", "Wind")))
+
+## PLOTTING
+fig1 <- ggplot(whole_se_coal %>% filter(scen_name == "Delayed action")) +
+  geom_boxplot(mapping = aes(x = variable, y = change, fill = variable), show.legend = FALSE) +
+  geom_point(mapping = aes(x = variable, y = change, shape = model_scope), size = 3) +
+  scale_shape_manual(values = c("global" = 1, "national" = 8)) +
+  theme_bw(base_size = 14) +
+  scale_fill_manual(values = c(style_lc), guide = "none") +
+  labs(x = "", y = "Change in generation, 2030 relative to 2020 (%)", subtitle = "Following NDC policies") +
+  theme(
+    text = element_text(size = 16),
+    legend.title = element_blank(),
+    legend.position = c(0.2, 0.8),
+    NULL
+  ) +
+  scale_size_manual(values = c(1, 1.5))
+
+medianVal <- whole_se_coal %>%
+  group_by(variable, scen_name) %>%
+  summarise(medianVal = median(change)) %>%
+  spread(scen_name, value = "medianVal")
+
+
+fig2 <- ggplot() +
+  geom_point(medianVal, mapping = aes(x = `Delayed action`, y = `Early action`, color = variable), size = 3) +
+  geom_abline(slope = 1, linetype = 2) +
+  scale_color_manual(values = c(style_lc)) +
+  coord_cartesian(ylim = c(-50, 300), xlim = c(-50, 300)) +
+  labs(
+    x = "Delayed action change (%),\n 2030 relative to 2020 (median)",
+    y = "Early action change (%),\n 2030 relative to 2020 (median)"
+  ) +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14)
+  )
+### plot
+fig1
+fig2
+```
+
+
+
+#### Share of generation by technology in 2030
+```{r}
+solar_wind <- c("Secondary Energy|Electricity|Solar",
+  "Secondary Energy|Electricity|Wind",
+  NULL
+)
+
+other <- c( "Secondary Energy|Electricity|Coal|w/ CCS",
+  "Secondary Energy|Electricity|Gas|w/ CCS",
+  "Secondary Energy|Electricity|Hydro",
+  "Secondary Energy|Electricity|Nuclear",
+  "Secondary Energy|Electricity|Biomass|w/o CCS",
+  "Secondary Energy|Electricity|Biomass|w/ CCS"
+)
+
+low_carbon <- c(solar_wind, other)
+
+Coal <- c(  "Secondary Energy|Electricity|Coal|w/ CCS",
+  "Secondary Energy|Electricity|Coal|w/o CCS"
+)
+
+Gas <- c( "Secondary Energy|Electricity|Gas|w/ CCS",
+  "Secondary Energy|Electricity|Gas|w/o CCS"
+)
+
+allVars <- c(Coal, Gas, solar_wind, other)
+
+whole_se_elec <- whole %>%
+  filter(variable %in% allVars) %>%
+  mutate(value = value * 277.778, unit = "TWh") # EJ to TWh
+
+wholeHighLow <- whole_se_elec %>%
+  mutate(category = if_else(variable %in% Coal, "Coal", if_else(variable %in% Gas, "Gas", "Low-Carbon"))) %>%
+  filter(!is.na(scen_name))
+
+# historical data from BP
+BP <- read.csv("data/BPHistorical2021.csv")
+BP <- BP %>% 
+  select(-1,-2) %>%
+  mutate(model = "2020", model_scope = "historical") %>%
+  separate(Data1, into = c("variable", "unit"), sep = " ") %>%
+  filter(!variable %in% c("Generation|Electricity|Renewable", "Generation|Electricity")) %>%
+  mutate(variable = gsub(x = variable, pattern = "Generation\\|Electricity", replacement = "Generation")) %>% 
+  mutate(category = if_else(variable == "Generation|Coal", "Coal", if_else(variable == "Generation|Gas", "Gas", "Low-Carbon")))
+
+colnames(BP) <- c("region", "year", "variable", "unit", "value", "model", "model_scope", "category")
+
+fig3 <- ggplot() +
+  geom_bar(wholeHighLow %>% filter(period == 2030, scen_name == "Delayed action"), mapping = aes(x = model, y = value, fill = category), stat = "identity", position = "fill") +
+  geom_bar(BP %>% filter(year == 2019), mapping = aes(x = model, y = value, fill = category), position = "fill", stat = "identity") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    axis.text = element_text(size = 14), axis.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 14),
+    strip.text = element_text(size = 14)
+  ) +
+  facet_grid(scen_name ~ factor(model_scope, levels = c("historical", "global", "national")), scales = "free", space = "free_x") +
+  scale_fill_manual(values = c(
+    "Coal" = "#0c0c0c",
+    "Gas" = "#999959",
+    "Low-Carbon" = "#ffcc00",
+    NULL
+  )) +
+  labs(x = "", y = "", title = "Share of generation by technology in 2030") +
+  scale_size_manual(values = c(1, 1.5)) +
+  geom_hline(yintercept = 0.26, linetype = 2)
+
+fig3
+```
+
+
+#### Stranded capacity REMIND early and delayed action
+
+```{r}
+strandDelayed <- ggplot() +
+  geom_bar(shite.2, mapping = aes(x = period, y = capacity, fill = age_group), stat = "identity") +
+  geom_line(data = whole_se_elec_coal %>% filter(period %in% c(2020:2060), scen_name == "Delayed action", model == "REMIND"), aes(x = period, y = value)) +
+  scale_fill_manual(values = brewer.pal(n = 4, name = "YlOrRd")) +
+  labs(
+    x = "Year",
+    y = "Coal Capacity (GW)",
+    subtitle = "Delayed action-REMIND"
+  ) +
+  coord_cartesian(ylim = c(0, 340)) +
+  theme_bw()+
+  theme(axis.text = element_text(size = 10), axis.title.x = element_blank())
+
+strandEarly <- ggplot() +
+  geom_bar(shite, mapping = aes(x = period, y = capacity, fill = age_group), stat = "identity") +
+  geom_line(data = whole_se_elec_coal %>% filter(period %in% c(2020:2060), scen_name == "Early action", model == "REMIND"), aes(x = period, y = value, group = interaction(model, scen_name))) +
+  labs(
+    x = "Year",
+    y = "Coal Capacity (GW)",
+    subtitle = "Early action-REMIND"
+  ) +
+  scale_fill_manual(values = brewer.pal(n = 4, name = "YlOrRd")) +
+  coord_cartesian(ylim = c(0, 340)) +
+  theme_bw()+
+  theme(axis.text = element_text(size = 10), axis.title.x = element_blank())
+
+strandDelayed
+strandEarly
+```
+
+
+#### Rescaled capacity from scenario data and natural-end-of-life development from bottom-up data
+
+```{r}
+remind <- whole_se_elec_coal %>%
+  filter(variable == "Secondary Energy|Electricity|Coal|w/o CCS", model == "REMIND", period %in% c(2020:2070)) %>%
+  select(1, 6, 9, 10)
+
+natural <- ic %>% filter(category %in% c("Sum (operating)", "Sum (op+construction)"))
+
+remind_natural_2030 <- shite.2 %>%
+  group_by(period, model) %>%
+  summarise(total = sum(capacity))
+
+ggplot() +
+  geom_line(remind, mapping = aes(x = period, y = value, group = scen_name, color = scen_name), linetype = "dashed") +
+  geom_line(natural %>% filter(period > 2018), mapping = aes(x = period, y = value, group = category, color = category)) +
+  scale_color_brewer(palette = "Dark2") +
+  geom_line(remind_natural_2030, mapping = aes(x = period, y = total, color = model)) +
+  geom_line(input.data.2 %>% filter(Status == "Operating", Year > 2015), mapping = aes(x = Year, y = sum / 1000), color = "black") +
+  labs(y = "Coal Capacity (GW)") +
+  geom_line(hist_IND %>% filter(variable == "Capacity|Electricity|Coal", model == "NITI AAYOG", period < 2016), mapping = aes(x = period, y = value / 1000), color = "black") +
+  theme_bw() +
+  theme(axis.title.x = element_blank())
+```
+
+
+### Chapter 3
+
+#### Coloring scheme
+
+```{r}
+  techs <- c("Solar", "Solar|PV", "Wind", "Hydro", "Biomass", "Biopower", "Coal", "Gas", "Nuclear", "Oil", "Solar|CSP")
+  
+  myColors <- c("#ffcc00", "#ffcc00", "#337fff", "#191999", "#005900", "#005900", "#000000", "#999959", "#ff33ff", "#663a00", "#cc0000", "#1B9E77", "#D95F02", "#7570B3", "#E6AB02")
+  
+  names(myColors) <- c(techs, "C & I", "O & M", "Fuel supply", "Manufacturing")
+```
+
+
+#### Job evolution until 2050
+
+```{r}
+# Figure 1a and 1b
+fuel <- df %>%
+  filter(Variable == "Jobs") %>%
+  mutate(type = ifelse(Tech %in% c("Coal", "Oil", "Gas"), "fossil", "non-fossil")) %>%
+  group_by(Year, Scenario, type) %>%
+  summarise(Value = sum(Value)) %>%
+  ungroup() %>%
+  spread(type, value = "Value") %>%
+  mutate(total = `fossil` + `non-fossil`) %>%
+  # adding new variable of "total jobs"
+  mutate(`nf_share` = (`non-fossil` / `total`) * 100) # add new variable (share of non-fossil to total jobs)
+
+fuel2 <- df %>%
+  filter(Variable == "Jobs") %>%
+  mutate(type = ifelse(Tech %in% c("Coal", "Oil", "Gas"), "fossil", "non-fossil")) %>%
+  group_by(Year, Scenario, type, Tech) %>%
+  summarise(Value = sum(Value)) %>%
+  ungroup()
+
+oa_all1 <- ggplot() +
+  geom_area(fuel %>% gather(3:6, key = "type", value = "value") %>% filter(Year > 2015, type != "nf_share", type != "total"), mapping = aes(x = Year, y = value, fill = type), stat = "identity") +
+  scale_y_continuous(labels = function(x) {
+    paste0(x / 1000000, "M")
+  }) +
+  labs(x = "", y = "") +
+  guides(linetype = "none") + # so linetypes don't show in the legend
+  theme_bw(base_size = 15) +
+  facet_wrap(~Scenario) +
+  theme(legend.title = element_blank())
+
+fuel2$Tech <- factor(fuel2$Tech, levels = c("Solar|PV", "Wind", "Hydro", "Biomass", "Geothermal", "Solar|CSP", "Coal", "Gas", "Oil", "Nuclear"))
+common <- c("Solar|PV", "Wind", "Hydro", "Biomass", "Solar|CSP", "Coal", "Gas", "Oil", "Nuclear")
+
+oa_all2 <- ggplot() +
+  geom_area(fuel2 %>% filter(Year > 2015, Tech != c("Geothermal")), mapping = aes(x = Year, y = Value, fill = Tech), stat = "identity") +
+  scale_y_continuous(labels = function(x) {
+    paste0(x / 1000000, "M")
+  }) +
+  labs(x = "", y = "") +
+  scale_color_manual(values = myColors, aesthetics = "fill", limits = common) +
+  theme_bw(base_size = 15) +
+  facet_wrap(~Scenario)
+
+mine <- ggpubr::ggarrange(oa_all1, oa_all2, ncol = 1, align = "v", labels = c("a", "b"))
+
+mine
+
+cutie <- df %>%
+  filter(Variable == "Jobs", Value > 0) %>%
+  group_by(Tech, Scenario, Activity, Year) %>%
+  summarise(Value = sum(Value))
+
+cutie2 <- df %>%
+  filter(Variable == "Jobs", Value > 0) %>%
+  group_by(Scenario, Activity, Year) %>%
+  summarise(Value = sum(Value)) %>%
+  mutate(Tech = "All")
+
+# for jobs in 2020
+
+cutieplot_all <- ggplot() +
+  geom_col(cutie2 %>% filter(Year == 2020, Scenario == "NDC"), mapping = aes(x = Tech, y = Value, fill = Activity)) +
+  scale_y_continuous(labels = function(x) {
+    paste0(x / 1000000, "M")
+  }) +
+  scale_fill_manual(values = myColors, limits = names(myColors)[12:15]) +
+  labs(x = "", y = "", subtitle = "Jobs in 2020") +
+  theme_bw() +
+  theme(text = element_text(size = 15))
+
+cutieplot2_all <- ggplot() +
+  geom_col(cutie2 %>% filter(Year == 2050), mapping = aes(x = Tech, y = Value, fill = Activity)) +
+  facet_grid(Scenario ~ .) +
+  scale_y_continuous(labels = function(x) {
+    paste0(x / 1000000, "M")
+  }) +
+  scale_fill_manual(values = myColors, limits = names(myColors)[12:15]) +
+  labs(x = "", y = "", subtitle = "Jobs in 2050") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 15),
+    NULL
+  )
+
+mine <- ggpubr::ggarrange(cutieplot_all, cutieplot2_all, nrow = 1, labels = c("a", "b"))
+
+```
+
+
+#### Difference in near-term jobs for the two scenarios
+
+```{r}
+pol_others <- df %>%
+  filter(!is.na(Value), Value > 0, Variable == "Jobs", Year %in% c(2030, 2020)) %>%
+  group_by(Year, Scenario, Activity, Tech) %>%
+  summarise(Value = sum(Value)) %>%
+  ungroup() %>%
+  spread(Year, value = Value) %>%
+  mutate(Delta = `2030` - `2020`) %>%
+  gather(c(`2020`, `2030`), key = "Year", value = "Value") %>%
+  filter(!is.na(Delta))
+
+# Jobs by tech only
+pol_others_tech <- df %>%
+  filter(!is.na(Value), Value > 0, Variable == "Jobs", Year %in% c(2030, 2020)) %>%
+  group_by(Year, Scenario, Tech) %>%
+  summarise(Value = sum(Value)) %>%
+  ungroup() %>%
+  spread(Year, value = Value) %>%
+  mutate(Delta = `2030` - `2020`) %>%
+  gather(c(`2020`, `2030`), key = "Year", value = "Value") %>%
+  filter(!is.na(Delta))
+
+haha_tech <- ggplot(pol_others_tech %>%
+  filter(Year == 2030)) +
+  geom_bar(aes(x = Year, y = Delta, fill = Tech), stat = "identity") +
+  facet_wrap(Scenario ~ ., nrow = 1) +
+  scale_y_continuous(labels = function(x) {
+    paste0(x / 1000000, "M")
+  }) +
+  labs(
+    x = "", y = "",
+    subtitle = "2030-2020 jobs",
+    tag = "a",
+    NULL
+  ) +
+  scale_fill_manual(values = myColors, limits = unique(pol_others$Tech)) +
+  theme_bw() +
+  theme(text = element_text(size = 15)) +
+  geom_point(pol_others_tech %>%
+    filter(Year == 2030) %>%
+    group_by(Scenario, Year) %>%
+    summarise(Delta = sum(Delta)),
+  mapping = aes(x = Year, y = Delta), shape = "cross", size = 2, stroke = 2, color = "white"
+  )
+
+haha_tech
+```
+### Chapter 4
+```{r}
+techs <- c("Solar", "Solar|PV", "Wind", "Hydro", "Biomass", "Biopower", "Coal", "Gas", "Nuclear", "Oil", "Solar|CSP")
+
+myColors <- c("#ffcc00", "#ffcc00", "#337fff", "#191999", "#005900", "#005900", "#000000", "#999959", "#ff33ff", "#663a00", "#cc0000", "#1B9E77", "#D95F02", "#7570B3", "#E6AB02")
+
+names(myColors) <- c(techs, "C & I", "O & M", "Fuel supply", "Manufacturing")
+```
+
+#### Main plot with all power plants and coal mines in India
+
+```{r}
+
+# plotting with map background and labels
+ind <- ggplot() +
+  geom_sf(IND2, mapping = aes(fill = location), color = "black", size = 0.5, show.legend = F, alpha = 0.8) + # country and state outline
+  geom_point(all_pp_ext %>%
+    filter(source == "Coal", status == "operating", type == "extraction"), mapping = aes(x = lon, y = lat, size = capacity), color = "red", show.legend = F) + # only coal mines
+  geom_point(all_pp_ext %>%
+    filter(source == "Coal", status == "operating", type == "power plant"), mapping = aes(x = lon, y = lat, color = source), alpha = 0.9, show.legend = F) + # only coal power plants
+  geom_point(all_pp_ext %>%
+    filter(source %in% c("Solar", "Wind"), status == "operating", type == "power plant", !lon <= 50, !lat > 32), mapping = aes(x = lon, y = lat, color = source), alpha = 0.7) +
+  geom_label_repel(IND2 %>% filter(!Code %in% c("PY", "DH", "AN")),
+    mapping = aes(x = lon, y = lat, label = Code), size = 2,
+    segment.color = "grey50",
+    arrow = arrow(length = unit(0.01, "npc")),
+    force = 0.5, fill = "light blue", nudge_x = 0.5, max.overlaps = 24
+  ) +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  coord_sf(datum = NA) +
+  labs(
+    x = "",
+    y = ""
+  ) +
+  guides(size = "none", colour = guide_legend(override.aes = list(alpha = 1))) +
+  scale_color_manual(values = myColors, limits = c("Solar", "Wind", "Coal"), aesthetics = "color")
+
+inlet <- data.frame(source = rep(c("Solar", "Wind"), each = 2), Z = c(1380, 2345, 465, 1215), P = c("NDC", "Pol")) # installed capacities for solar and wind in NDC and POl scenarios, appears as dashed line
+
+ws <- ggplot() +
+  geom_col(bar_plot %>% filter(location == "Western states"), mapping = aes(x = Code, y = value, group = variable, fill = variable), position = position_dodge(), show.legend = F) +
+  geom_hline(data = inlet, aes(yintercept = Z, color = P), linetype = "dashed", show.legend = F) + # for NDC and Pol
+  scale_y_log10(limits = c(0.1, 20000)) +
+  coord_cartesian(ylim = c(1, 15000)) +
+  scale_fill_brewer(type = "qual", palette = 3) +
+  scale_color_brewer(type = "qual", palette = "Set1") +
+  labs(x = "", y = "", subtitle = "Western states") +
+  theme_bw() +
+  facet_wrap(~source) +
+  theme(
+    plot.subtitle = element_text(colour = "#7570B3"), # color of subtitle same as color of states
+    legend.title = element_blank(),
+    plot.margin = margin(t = 0, r = 0, b = 0, l = 0),
+   ) +
+  guides(col = guide_legend(ncol = 2), fill = guide_legend(ncol = 2)) # no legend heading
+
+
+ss <- ggplot() +
+  geom_col(bar_plot %>% filter(variable != "Total", location == "Southern states"), mapping = aes(x = Code, y = value, group = variable, fill = variable), position = position_dodge(), show.legend = F) +
+  geom_hline(data = inlet, aes(yintercept = Z, color = P), linetype = "dashed", show.legend = F) +
+  scale_y_log10(limits = c(0.1, 10000)) +
+  coord_cartesian(ylim = c(1, 10000)) +
+  scale_fill_brewer(type = "qual", palette = 3) +
+  scale_color_brewer(type = "qual", palette = "Set1") +
+  facet_wrap(~source) +
+  theme_bw() +
+  theme(
+    plot.subtitle = element_text(color = "#D95F02"),
+    legend.title = element_blank(),
+    plot.margin = margin(t = 0, r = 0, b = 0, l = 0),
+  ) +
+  labs(x = "", y = "", subtitle = "Southern states")
+
+
+es_dt2 <- es_dt %>%
+  spread(key = "constraint", value = "value") %>%
+  filter(source == "Solar", variable == "theoretical potential", Code != "WB")
+
+es <- ggplot() +
+  geom_col(es_dt %>% filter(constraint == "high"), mapping = aes(x = Code, y = value, fill = variable), position = position_dodge(), show.legend = F) +
+  geom_errorbar(es_dt2, mapping = aes(ymin = high, ymax = low, x = Code), position = position_nudge(x = -0.3), width = 0.3) +
+  geom_pointrange(es_dt2, mapping = aes(ymin = high, ymax = low, x = Code, y = medium), position = position_nudge(x = -0.3), size = 0.1) +
+  scale_y_log10(limits = c(0.1, 3000)) +
+  coord_cartesian(ylim = c(1, 3000)) +
+  scale_fill_brewer(type = "qual", palette = 3) +
+  scale_color_brewer(type = "qual", palette = "Set1") +
+  facet_wrap(~source) +
+  theme_bw() +
+  labs(x = "", y = "Capacity (GW)", subtitle = "Eastern states") +
+  theme(
+    plot.subtitle = element_text(color = "#1B9E77"),
+    legend.title = element_blank(),
+  )
+
+
+left_p <- (guide_area() / ws / ss / es) + plot_layout(guides = "collect") & theme(legend.position = "top", legend.box = "vertical", legend.margin = margin(), plot.subtitle = element_text(face = "bold"), plot.margin = margin(t = 1, r = 0, b = 0, l = 0))
+
+right_p <- (ind)
+
+(left_p | right_p) + plot_layout(widths = c(1, 2)) & theme(legend.position = "top", plot.margin = margin(t = 0, r = 0, b = 0, l = 0))
+```
+
+```{r}
+## for presentation
+es <- ggplot() +
+  geom_col(es_dt %>% filter(constraint == "high", Code != "WB", variable == "theoretical potential", source == "Solar"), mapping = aes(x = Code, y = value, fill = variable), position = position_dodge(), show.legend = F) +
+  geom_errorbar(es_dt2, mapping = aes(ymin = high, ymax = low, x = Code), position = position_nudge(x = 0.0), width = 0.3) +
+  geom_pointrange(es_dt2, mapping = aes(ymin = high, ymax = low, x = Code, y = medium), position = position_nudge(x = 0.0), size = 0.3) +
+  # geom_hline(data = inlet,aes(yintercept=Z,color=P),linetype="dashed",show.legend = F)+
+  scale_y_log10(limits = c(1, 3000)) +
+  coord_cartesian(ylim = c(1, 3000)) +
+  scale_fill_brewer(type = "qual", palette = 3) +
+  scale_color_brewer(type = "qual", palette = "Set1") +
+  facet_wrap(~source) +
+  theme_bw() +
+  labs(x = "", y = "Theoretical Potential (GW)", subtitle = "Eastern states") +
+  theme(
+    plot.subtitle = element_text(color = "#1B9E77"),
+    legend.title = element_blank(),
+    text = element_text(size = 15)
+  )
+
+es
+```
+
+
+
