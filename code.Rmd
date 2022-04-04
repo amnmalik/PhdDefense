@@ -41,7 +41,7 @@ library(patchwork)
 
 ```{r data_input_ch2_part1, warning=FALSE}
 ## Chapter 2, part 1
-load("data/data_IND2019_12_02.RData")
+load("data/data_IND2019_08_12.RData")
 models <- inline.data.frame(
   "model;                       model.name",
   "REMIND-MAgPIE 1.7-3.0;         REMIND",
